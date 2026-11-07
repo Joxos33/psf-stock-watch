@@ -15,6 +15,9 @@ define( 'PSFSW_STATUS', 'on-layaway' );
 define( 'PSFSW_THRESHOLD', 3 );          // alert when combined qty < this
 define( 'PSFSW_ORDERED_META', '_psflh_item_ordered' );
 define( 'PSFSW_UPC_META', 'upc' );
+define( 'PSFSW_LOCK', 'psfsw_lock' );
+define( 'PSFSW_LOCK_TTL', 15 * MINUTE_IN_SECONDS ); // stale-lock cutoff
+define( 'PSFSW_TIME_BUDGET', 120 );     // seconds of provider calls per run
 
 /* -------------------------------------------------------------------------
  * Schedule
@@ -65,6 +68,7 @@ function psfsw_unordered_items() {
 			$rows[] = array(
 				'order_id'     => $order->get_id(),
 				'order_number' => $order->get_order_number(),
+				'edit_url'     => $order->get_edit_order_url(),
 				'customer'     => trim( $order->get_formatted_billing_full_name() ),
 				'item_id'      => $item_id,
 				'name'         => $item->get_name(),
@@ -90,17 +94,67 @@ function psfsw_distributor_stock( $upc, $row = array() ) {
 	if ( null === $result ) {
 		return new WP_Error( 'psfsw_no_provider', 'No distributor stock provider is registered.' );
 	}
-	return $result;
+	if ( is_wp_error( $result ) ) {
+		return $result;
+	}
+	if ( ! is_array( $result ) ) {
+		return new WP_Error( 'psfsw_bad_provider', 'Distributor stock provider returned an invalid result.' );
+	}
+
+	// Normalise: keep only well-formed [ 'dist' => string, 'qty' => int ] entries.
+	$clean = array();
+	foreach ( $result as $s ) {
+		if ( ! is_array( $s ) || ! isset( $s['qty'] ) || ! is_scalar( $s['qty'] ) ) {
+			continue;
+		}
+		$clean[] = array(
+			'dist' => isset( $s['dist'] ) && is_scalar( $s['dist'] ) ? (string) $s['dist'] : '?',
+			'qty'  => max( 0, (int) $s['qty'] ),
+		);
+	}
+	return $clean;
+}
+
+/**
+ * Take the run lock. add_option() is an atomic INSERT, so only one caller wins.
+ * A lock older than PSFSW_LOCK_TTL is treated as left over from a crashed run.
+ */
+function psfsw_acquire_lock() {
+	if ( add_option( PSFSW_LOCK, time(), '', 'no' ) ) {
+		return true;
+	}
+	$since = (int) get_option( PSFSW_LOCK );
+	if ( $since && ( time() - $since ) < PSFSW_LOCK_TTL ) {
+		return false;
+	}
+	delete_option( PSFSW_LOCK );
+	return add_option( PSFSW_LOCK, time(), '', 'no' );
+}
+
+function psfsw_release_lock() {
+	delete_option( PSFSW_LOCK );
 }
 
 /**
  * Run the check, store results, email if the flagged set changed.
  */
 function psfsw_run() {
-	$items   = psfsw_unordered_items();
-	$cache   = array();
-	$flagged = array();
-	$errors  = array();
+	if ( ! psfsw_acquire_lock() ) {
+		return new WP_Error( 'psfsw_locked', 'A Stock Watch run is already in progress.' );
+	}
+	try {
+		return psfsw_run_locked();
+	} finally {
+		psfsw_release_lock();
+	}
+}
+
+function psfsw_run_locked() {
+	$items    = psfsw_unordered_items();
+	$cache    = array();
+	$flagged  = array();
+	$errors   = array();
+	$deadline = time() + (int) apply_filters( 'psfsw_time_budget', PSFSW_TIME_BUDGET );
 
 	foreach ( $items as $row ) {
 		if ( '' === $row['upc'] && '' === $row['sku'] ) {
@@ -109,6 +163,11 @@ function psfsw_run() {
 		}
 		$ck = $row['upc'] ? $row['upc'] : 'sku:' . $row['sku'];
 		if ( ! isset( $cache[ $ck ] ) ) {
+			if ( time() >= $deadline ) {
+				// Out of time: record the rest rather than dying mid-run with no report saved.
+				$errors[] = $row + array( 'error' => 'Skipped: run time limit reached' );
+				continue;
+			}
 			$cache[ $ck ] = psfsw_distributor_stock( $row['upc'], $row );
 		}
 		$stock = $cache[ $ck ];
@@ -118,7 +177,7 @@ function psfsw_run() {
 			continue;
 		}
 
-		$total = array_sum( array_map( 'intval', wp_list_pluck( $stock, 'qty' ) ) );
+		$total = array_sum( wp_list_pluck( $stock, 'qty' ) );
 		if ( $total < PSFSW_THRESHOLD ) {
 			$flagged[] = $row + array( 'total' => $total, 'stock' => $stock );
 		}
@@ -146,27 +205,38 @@ function psfsw_run() {
  * Output
  * ---------------------------------------------------------------------- */
 
-function psfsw_table( $report ) {
+function psfsw_order_edit_url( $r ) {
+	if ( ! empty( $r['edit_url'] ) ) {
+		return $r['edit_url'];
+	}
+	// Reports saved before edit_url was stored.
+	return admin_url( 'post.php?post=' . (int) $r['order_id'] . '&action=edit' );
+}
+
+/**
+ * @param bool $show_customer Include customer names (admin screen yes, email no).
+ */
+function psfsw_table( $report, $show_customer = true ) {
 	if ( empty( $report['flagged'] ) ) {
 		return '<p>No unordered layaway items are below ' . PSFSW_THRESHOLD . ' combined distributor stock.</p>';
 	}
 	$h  = '<table cellpadding="6" cellspacing="0" border="1" style="border-collapse:collapse;font:13px sans-serif">';
-	$h .= '<tr style="background:#f2f2f2"><th>Order</th><th>Customer</th><th>Item</th><th>UPC</th><th>Distributors</th><th>Total</th></tr>';
+	$h .= '<tr style="background:#f2f2f2"><th>Order</th>' . ( $show_customer ? '<th>Customer</th>' : '' ) . '<th>Item</th><th>UPC</th><th>Distributors</th><th>Total</th></tr>';
 	foreach ( $report['flagged'] as $r ) {
 		$dists = array();
 		foreach ( $r['stock'] as $s ) {
 			$dists[] = esc_html( $s['dist'] ) . ': ' . (int) $s['qty'];
 		}
 		$h .= sprintf(
-			'<tr><td><a href="%s">#%s</a></td><td>%s</td><td>%s<br><small>%s</small></td><td>%s</td><td>%s</td><td style="color:#b00;font-weight:bold">%d</td></tr>',
-			esc_url( admin_url( 'post.php?post=' . $r['order_id'] . '&action=edit' ) ),
+			'<tr><td><a href="%s">#%s</a></td>%s<td>%s<br><small>%s</small></td><td>%s</td><td>%s</td><td style="color:#b00;font-weight:bold">%d</td></tr>',
+			esc_url( psfsw_order_edit_url( $r ) ),
 			esc_html( $r['order_number'] ),
-			esc_html( $r['customer'] ),
+			$show_customer ? '<td>' . esc_html( $r['customer'] ) . '</td>' : '',
 			esc_html( $r['name'] ),
 			esc_html( $r['sku'] ),
 			esc_html( $r['upc'] ),
 			$dists ? implode( '<br>', $dists ) : '<em>none listed</em>',
-			$r['total']
+			(int) $r['total']
 		);
 	}
 	return $h . '</table>';
@@ -176,7 +246,7 @@ function psfsw_email( $report ) {
 	$to      = apply_filters( 'psfsw_email_to', get_option( 'admin_email' ) );
 	$subject = sprintf( '[PSF] %d layaway item(s) low at distributors', count( $report['flagged'] ) );
 	$body    = '<p>Unordered On Layaway items with fewer than ' . PSFSW_THRESHOLD . ' units across all distributors:</p>'
-		. psfsw_table( $report )
+		. psfsw_table( $report, false ) // no customer PII in email; names are on the admin screen
 		. '<p style="color:#666;font-size:12px">Checked ' . (int) $report['checked'] . ' items at ' . esc_html( $report['ran_at'] ) . '.</p>';
 
 	wp_mail( $to, $subject, $body, array( 'Content-Type: text/html; charset=UTF-8' ) );
@@ -195,14 +265,21 @@ add_action( 'admin_post_psfsw_run_now', function () {
 		wp_die( 'Not allowed' );
 	}
 	check_admin_referer( 'psfsw_run_now' );
-	psfsw_run();
-	wp_safe_redirect( admin_url( 'admin.php?page=psf-stock-watch' ) );
+	$result = psfsw_run();
+	$url    = admin_url( 'admin.php?page=psf-stock-watch' );
+	if ( is_wp_error( $result ) && 'psfsw_locked' === $result->get_error_code() ) {
+		$url = add_query_arg( 'psfsw_locked', '1', $url );
+	}
+	wp_safe_redirect( $url );
 	exit;
 } );
 
 function psfsw_admin_page() {
 	$report = get_option( 'psfsw_last_report' );
 	echo '<div class="wrap"><h1>Stock Watch</h1>';
+	if ( ! empty( $_GET['psfsw_locked'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification -- display-only flag.
+		echo '<div class="notice notice-warning"><p>A run is already in progress. Refresh in a minute to see the results.</p></div>';
+	}
 	echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
 	wp_nonce_field( 'psfsw_run_now' );
 	echo '<input type="hidden" name="action" value="psfsw_run_now"><p><button class="button button-primary">Run now</button>';
@@ -222,7 +299,7 @@ function psfsw_admin_page() {
 		foreach ( $report['errors'] as $e ) {
 			printf(
 				'<li><a href="%s">#%s</a> %s — %s</li>',
-				esc_url( admin_url( 'post.php?post=' . $e['order_id'] . '&action=edit' ) ),
+				esc_url( psfsw_order_edit_url( $e ) ),
 				esc_html( $e['order_number'] ),
 				esc_html( $e['name'] ),
 				esc_html( $e['error'] )

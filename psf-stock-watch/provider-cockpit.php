@@ -68,8 +68,19 @@ function psfsw_cockpit_order_options( $order_id ) {
 		);
 	}
 
+	$data = array(
+		'order_id'   => (string) $order_id,
+		'line_items' => $line_items,
+	);
+	// The key goes in the x-api-key header only; request bodies are more likely
+	// to end up in logs. If the API turns out to require it in the body too,
+	// re-enable with: add_filter( 'psfsw_cockpit_key_in_body', '__return_true' );
+	if ( apply_filters( 'psfsw_cockpit_key_in_body', false ) ) {
+		$data = array( 'api_key' => $key ) + $data;
+	}
+
 	$res = wp_remote_post( 'https://ffl-api.garidium.com', array(
-		'timeout' => 30,
+		'timeout' => 15,
 		'headers' => array(
 			'Accept'       => 'application/json',
 			'Content-Type' => 'application/json',
@@ -77,11 +88,7 @@ function psfsw_cockpit_order_options( $order_id ) {
 		),
 		'body'    => wp_json_encode( array(
 			'action' => 'get_fulfillment_summary',
-			'data'   => array(
-				'api_key'    => $key,
-				'order_id'   => (string) $order_id,
-				'line_items' => $line_items,
-			),
+			'data'   => $data,
 		) ),
 	) );
 
