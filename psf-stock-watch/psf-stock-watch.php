@@ -116,19 +116,45 @@ function psfsw_distributor_stock( $upc, $row = array() ) {
 }
 
 /**
- * Take the run lock. add_option() is an atomic INSERT, so only one caller wins.
- * A lock older than PSFSW_LOCK_TTL is treated as left over from a crashed run.
+ * Take the run lock.
+ *
+ * Uses raw SQL because add_option() is not atomic (it checks, then writes with
+ * ON DUPLICATE KEY UPDATE). INSERT IGNORE lets exactly one caller create the
+ * row. A lock older than PSFSW_LOCK_TTL is treated as left over from a crashed
+ * run and is taken over with a compare-and-swap UPDATE on the timestamp we
+ * read, so two callers that both see the same stale lock can't both win.
  */
 function psfsw_acquire_lock() {
-	if ( add_option( PSFSW_LOCK, time(), '', 'no' ) ) {
+	global $wpdb;
+	$now = time();
+
+	$inserted = $wpdb->query( $wpdb->prepare(
+		"INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+		PSFSW_LOCK,
+		$now
+	) );
+	if ( $inserted ) {
+		wp_cache_delete( PSFSW_LOCK, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
 		return true;
 	}
-	$since = (int) get_option( PSFSW_LOCK );
-	if ( $since && ( time() - $since ) < PSFSW_LOCK_TTL ) {
-		return false;
+
+	$since = $wpdb->get_var( $wpdb->prepare(
+		"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s",
+		PSFSW_LOCK
+	) );
+	if ( null === $since || ( $now - (int) $since ) < PSFSW_LOCK_TTL ) {
+		return false; // held (or released this instant; the next run will pick it up)
 	}
-	delete_option( PSFSW_LOCK );
-	return add_option( PSFSW_LOCK, time(), '', 'no' );
+
+	$swapped = $wpdb->query( $wpdb->prepare(
+		"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+		$now,
+		PSFSW_LOCK,
+		$since
+	) );
+	wp_cache_delete( PSFSW_LOCK, 'options' );
+	return 1 === (int) $swapped;
 }
 
 function psfsw_release_lock() {
@@ -156,7 +182,32 @@ function psfsw_run_locked() {
 	$errors   = array();
 	$deadline = time() + (int) apply_filters( 'psfsw_time_budget', PSFSW_TIME_BUDGET );
 
+	// Check the orders that have gone longest without a check first, so when a
+	// run hits the time budget the next run picks up where this one left off
+	// instead of skipping the same tail every time.
+	$checked_at = get_option( 'psfsw_checked_at', array() );
+	$checked_at = is_array( $checked_at ) ? $checked_at : array();
+	foreach ( $items as $i => &$row ) {
+		$row['_pos'] = $i;
+	}
+	unset( $row );
+	usort( $items, function ( $a, $b ) use ( $checked_at ) {
+		$ta = (int) ( $checked_at[ $a['order_id'] ] ?? 0 );
+		$tb = (int) ( $checked_at[ $b['order_id'] ] ?? 0 );
+		return $ta <=> $tb ?: $a['_pos'] <=> $b['_pos'];
+	} );
+
+	// Items flagged last time stay flagged if this run doesn't reach them, so a
+	// partial run doesn't make an alert disappear and reappear.
+	$prev         = get_option( 'psfsw_last_report' );
+	$prev_flagged = array();
+	foreach ( ( is_array( $prev ) && ! empty( $prev['flagged'] ) ) ? $prev['flagged'] : array() as $f ) {
+		$prev_flagged[ $f['item_id'] ] = $f;
+	}
+
+	$now_checked = array();
 	foreach ( $items as $row ) {
+		unset( $row['_pos'] );
 		if ( '' === $row['upc'] && '' === $row['sku'] ) {
 			$errors[] = $row + array( 'error' => 'No UPC or SKU on product' );
 			continue;
@@ -165,11 +216,16 @@ function psfsw_run_locked() {
 		if ( ! isset( $cache[ $ck ] ) ) {
 			if ( time() >= $deadline ) {
 				// Out of time: record the rest rather than dying mid-run with no report saved.
-				$errors[] = $row + array( 'error' => 'Skipped: run time limit reached' );
+				if ( isset( $prev_flagged[ $row['item_id'] ] ) ) {
+					$flagged[] = $prev_flagged[ $row['item_id'] ] + array( 'stale' => true );
+				} else {
+					$errors[] = $row + array( 'error' => 'Skipped: run time limit reached; will be checked first next run' );
+				}
 				continue;
 			}
 			$cache[ $ck ] = psfsw_distributor_stock( $row['upc'], $row );
 		}
+		$now_checked[ $row['order_id'] ] = time();
 		$stock = $cache[ $ck ];
 
 		if ( is_wp_error( $stock ) ) {
@@ -190,6 +246,10 @@ function psfsw_run_locked() {
 		'errors'  => $errors,
 	);
 	update_option( 'psfsw_last_report', $report, false );
+
+	// Remember when each order was last checked; drop orders no longer on layaway.
+	$live = array_flip( wp_list_pluck( $items, 'order_id' ) );
+	update_option( 'psfsw_checked_at', array_intersect_key( $now_checked + $checked_at, $live ), false );
 
 	// Only email when the set of flagged line items changes.
 	$sig = md5( wp_json_encode( wp_list_pluck( $flagged, 'item_id' ) ) . '|' . wp_json_encode( wp_list_pluck( $flagged, 'total' ) ) );
@@ -234,7 +294,7 @@ function psfsw_table( $report, $show_customer = true ) {
 			$show_customer ? '<td>' . esc_html( $r['customer'] ) . '</td>' : '',
 			esc_html( $r['name'] ),
 			esc_html( $r['sku'] ),
-			esc_html( $r['upc'] ),
+			esc_html( $r['upc'] ) . ( empty( $r['stale'] ) ? '' : '<br><small>from previous run</small>' ),
 			$dists ? implode( '<br>', $dists ) : '<em>none listed</em>',
 			(int) $r['total']
 		);

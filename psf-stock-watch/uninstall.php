@@ -9,4 +9,5 @@ defined( 'WP_UNINSTALL_PLUGIN' ) || exit;
 delete_option( 'psfsw_last_report' );
 delete_option( 'psfsw_last_sig' );
 delete_option( 'psfsw_lock' );
+delete_option( 'psfsw_checked_at' );
 wp_clear_scheduled_hook( 'psfsw_run' );
